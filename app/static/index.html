@@ -9,7 +9,7 @@
 <body>
   <header>
     <h1>陶瓷合窑装载确认台</h1>
-    <div class="sub">登记待烧批次 · 装窑草案预览 · 版本校验后确认 · 已确认清单不可变</div>
+    <div class="sub">登记待烧批次 · 装窑草案预览 · 版本校验后确认 · 已确认清单不可变 · 按窑安排烧成时段</div>
   </header>
 
   <div id="toast" class="toast hidden"></div>
@@ -92,6 +92,56 @@
       <div id="load-list"></div>
     </section>
   </main>
+
+  <!-- 烧成时段安排（整行） -->
+  <section class="card" style="margin:0 16px 16px">
+    <h2>④ 烧成时段安排（已确认窑次）</h2>
+    <div class="sub" style="font-size:12.5px;color:#75695a;margin:-4px 0 12px">
+      只能从已确认窑次中选择；同一窑次只能安排一次（可修改）；起止时间须带时区且开始早于结束；
+      拟用峰温/保温必须落在该窑次<b>确认时的共同区间</b>（之后修改的批次范围无效）；
+      同一台窑时段不得重叠，首尾相接允许，不同窑可同时烧成。保存时按服务器最新安排重查，冲突会指出占用窑次，本次失败原安排不变。
+    </div>
+
+    <form id="schedule-form" class="schedule-form">
+      <label>已确认窑次
+        <select id="sc-load"></select>
+      </label>
+      <label>窑炉
+        <input id="sc-kiln" readonly />
+      </label>
+      <label>允许峰温(°C)
+        <input id="sc-peak-range" readonly style="width:120px" />
+      </label>
+      <label>允许保温(min)
+        <input id="sc-hold-range" readonly style="width:110px" />
+      </label>
+      <label>开始（本地）
+        <input id="sc-start" type="datetime-local" step="1" required />
+      </label>
+      <label>时区
+        <select id="sc-tz-start"></select>
+      </label>
+      <label>结束（本地）
+        <input id="sc-end" type="datetime-local" step="1" required />
+      </label>
+      <label>时区
+        <select id="sc-tz-end"></select>
+      </label>
+      <label>拟用峰温 °C
+        <input id="sc-peak" type="number" step="0.1" required style="width:90px" />
+      </label>
+      <label>拟用保温 min
+        <input id="sc-hold" type="number" step="1" required style="width:80px" />
+      </label>
+      <button type="submit" id="sc-submit" class="accent">保存安排</button>
+      <button type="button" id="sc-cancel" class="secondary hidden">取消修改</button>
+    </form>
+    <div class="row-form" style="margin-top:6px">
+      <button id="sc-refresh" class="secondary">刷新安排</button>
+      <span id="sc-hint" class="hint"></span>
+    </div>
+    <div id="schedule-board" class="sched-board"></div>
+  </section>
 
   <script src="/static/app.js"></script>
 </body>

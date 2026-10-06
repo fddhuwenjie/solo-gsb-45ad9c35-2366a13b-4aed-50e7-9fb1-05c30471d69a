@@ -82,3 +82,26 @@ CREATE TABLE IF NOT EXISTS confirmed_load_items (
     hold_max       INTEGER NOT NULL,
     UNIQUE (load_id, pos_no)
 );
+
+-- 烧成时段安排：给“已确认窑次”安排烧成起止时间与拟用工艺参数。
+-- * 每个已确认窑次至多安排一次：UNIQUE(load_id)；
+-- * 可反复修改（UPDATE），但 confirmed_* 快照表始终不增删改；
+--   拟用峰温/保温必须落在 confirmed_loads 确认时的共同区间内，
+--   即“清单确认时的共同区间”，批次后来的修改不影响允许范围；
+-- * start_at/end_at 保存提交时的带时区 ISO 8601 原文；
+--   start_utc/end_utc 为归一化 UTC 定长串，供同窑时间段重叠按字符串比较；
+-- * 同窑时间段重叠无法用普通表约束表达，由应用在 BEGIN IMMEDIATE
+--   事务内串行化重查：并发争用同一时段时只有一个事务能提交。
+CREATE TABLE IF NOT EXISTS firing_schedules (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    load_id      INTEGER NOT NULL UNIQUE REFERENCES confirmed_loads(id),
+    kiln_id      INTEGER NOT NULL REFERENCES kilns(id),
+    start_at     TEXT NOT NULL,
+    end_at       TEXT NOT NULL,
+    start_utc    TEXT NOT NULL,
+    end_utc      TEXT NOT NULL,
+    peak_temp    REAL NOT NULL,
+    hold_minutes INTEGER NOT NULL,
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);

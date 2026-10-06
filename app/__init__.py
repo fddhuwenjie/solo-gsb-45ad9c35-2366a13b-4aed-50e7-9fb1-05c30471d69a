@@ -7,9 +7,13 @@
   批次未被其他已确认窑次占用），任一失败整体不改动；
 - confirmed_* 表只增不改，批次被某窑次占用由 UNIQUE(batch_id) 保证，
   并发争用同一批次时只有一个事务能提交。
+- 烧成时段安排（firing_schedules）为独立可改数据：只引用已确认窑次，
+  参数必须落在确认快照的共同区间内，同窑时段在 IMMEDIATE 事务内重查防重叠；
+  任何路径都不改动 confirmed_* 快照。
 """
 import numbers
 import sqlite3
+from datetime import datetime, timezone
 
 from flask import Flask, jsonify, request, send_from_directory
 
@@ -694,10 +698,12 @@ def create_app():
         rows = db.execute(
             """SELECT cl.id, cl.name, k.code AS kiln_code,
                       cl.peak_min, cl.peak_max, cl.hold_min, cl.hold_max,
-                      cl.confirmed_at, COUNT(cli.id) AS item_count
+                      cl.confirmed_at, COUNT(cli.id) AS item_count,
+                      fs.id AS schedule_id
                  FROM confirmed_loads cl
                  JOIN kilns k ON k.id = cl.kiln_id
                  LEFT JOIN confirmed_load_items cli ON cli.load_id = cl.id
+                 LEFT JOIN firing_schedules fs ON fs.load_id = cl.id
                 GROUP BY cl.id ORDER BY cl.id"""
         ).fetchall()
         return jsonify([dict(r) for r in rows])
@@ -705,5 +711,222 @@ def create_app():
     @app.route("/api/loads/<int:load_id>", methods=["GET"])
     def get_load(load_id):
         return load_detail(get_db(), load_id)
+
+    # ------------------------------------------------------------------
+    # 烧成时段安排（给已确认窑次安排烧成时间与拟用工艺参数）
+    #
+    # 规则：
+    # - 只能从“已确认窑次”（confirmed_loads 快照）中选择，一个窑次只能安排一次
+    #   （firing_schedules.load_id UNIQUE，修改为 UPDATE 同一行）；
+    # - 起止时间必须携带时区（ISO 8601），开始严格早于结束；首尾相接允许，
+    #   因此重叠判定为半开区间 [start, end)：end == 另一段 start 不算冲突；
+    # - 拟用峰温/保温必须落在“该窑次确认时”的共同区间（confirmed_loads
+    #   快照 peak_min..peak_max / hold_min..hold_max）内，不取批次后来的范围；
+    # - 同一台窑的时间段不得重叠，不同窑同一时段允许同时烧成；
+    # - 保存（新增/修改）在 BEGIN IMMEDIATE 事务内按数据库中最新安排重查全部
+    #   条件，任一冲突都指出占用窑次且原安排不变；并发争用同一时段只有一个成功。
+    # - 不改动 confirmed_* 任何快照数据。
+    # ------------------------------------------------------------------
+
+    def parse_zoned_time(value, field_name):
+        """解析带时区的 ISO 8601 时间，返回 aware datetime 或错误字符串。"""
+        if not isinstance(value, str) or not value.strip():
+            return None, f"{field_name}必须是带时区的 ISO 8601 时间字符串"
+        text = value.strip()
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None, f"{field_name}不是合法的 ISO 8601 时间：{text}"
+        if dt.tzinfo is None:
+            return None, f"{field_name}必须携带时区偏移（如 +08:00 或 Z）：{text}"
+        return dt, None
+
+    def utc_key(dt):
+        """归一化为 UTC 定长串（秒精度，零填充），可直接按字符串比较先后。"""
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def schedule_json(row):
+        return {
+            "id": row["id"],
+            "load_id": row["load_id"],
+            "load_name": row["load_name"],
+            "kiln_id": row["kiln_id"],
+            "kiln_code": row["kiln_code"],
+            "start_at": row["start_at"],
+            "end_at": row["end_at"],
+            "start_utc": row["start_utc"],
+            "end_utc": row["end_utc"],
+            "peak_temp": row["peak_temp"],
+            "hold_minutes": row["hold_minutes"],
+            "updated_at": row["updated_at"],
+            # 该窑次确认时的共同区间快照（允许取值范围）
+            "allowed_peak_min": row["allowed_peak_min"],
+            "allowed_peak_max": row["allowed_peak_max"],
+            "allowed_hold_min": row["allowed_hold_min"],
+            "allowed_hold_max": row["allowed_hold_max"],
+        }
+
+    SCHEDULE_SELECT = """
+        SELECT fs.*, cl.name AS load_name, k.code AS kiln_code,
+               cl.peak_min AS allowed_peak_min, cl.peak_max AS allowed_peak_max,
+               cl.hold_min AS allowed_hold_min, cl.hold_max AS allowed_hold_max
+          FROM firing_schedules fs
+          JOIN confirmed_loads cl ON cl.id = fs.load_id
+          JOIN kilns k ON k.id = fs.kiln_id"""
+
+    @app.route("/api/schedules", methods=["GET"])
+    def list_schedules():
+        db = get_db()
+        rows = db.execute(
+            SCHEDULE_SELECT + " ORDER BY fs.kiln_id, fs.start_utc, fs.id"
+        ).fetchall()
+        return jsonify([schedule_json(r) for r in rows])
+
+    @app.route("/api/schedules/loads/<int:load_id>", methods=["PUT"])
+    def put_schedule(load_id):
+        """为已确认窑次新建或修改烧成安排（按窑次寻址，一个窑次至多一条）。"""
+        data = json_body()
+
+        start_dt, e = parse_zoned_time(data.get("start_at"), "开始时间")
+        if e:
+            return err(400, e)
+        end_dt, e = parse_zoned_time(data.get("end_at"), "结束时间")
+        if e:
+            return err(400, e)
+        if not start_dt < end_dt:
+            return err(400, "开始时间必须严格早于结束时间")
+
+        peak = data.get("peak_temp")
+        if isinstance(peak, bool) or not isinstance(peak, numbers.Real):
+            return err(400, "拟用峰温必须是数字")
+        hold = data.get("hold_minutes")
+        if isinstance(hold, bool) or not isinstance(hold, int):
+            return err(400, "拟用保温分钟必须是整数")
+
+        start_utc = utc_key(start_dt)
+        end_utc = utc_key(end_dt)
+
+        db = get_db()
+        try:
+            # BEGIN IMMEDIATE：并发安排/修改在此排队，保证按最新安排重查与写入原子
+            db.execute("BEGIN IMMEDIATE")
+
+            load = db.execute(
+                """SELECT cl.id, cl.kiln_id, cl.name, k.code AS kiln_code,
+                          cl.peak_min, cl.peak_max, cl.hold_min, cl.hold_max
+                     FROM confirmed_loads cl JOIN kilns k ON k.id = cl.kiln_id
+                    WHERE cl.id = ?""",
+                (load_id,),
+            ).fetchone()
+            if load is None:
+                db.rollback()
+                return err(404, "窑次不存在或尚未确认，只能为已确认窑次安排烧成时段")
+
+            # 拟用参数必须落在“清单确认时”的共同区间快照内（不看批次后续修改）
+            if not (load["peak_min"] <= float(peak) <= load["peak_max"]):
+                db.rollback()
+                return err(
+                    400,
+                    f"拟用峰温 {peak} °C 不在窑次 #{load_id} 确认时的共同峰温区间 "
+                    f"{load['peak_min']:g} ~ {load['peak_max']:g} °C 内"
+                    "（以确认清单快照为准，批次后来的修改不算数）",
+                    allowed_peak_min=load["peak_min"],
+                    allowed_peak_max=load["peak_max"],
+                )
+            if not (load["hold_min"] <= hold <= load["hold_max"]):
+                db.rollback()
+                return err(
+                    400,
+                    f"拟用保温 {hold} 分钟不在窑次 #{load_id} 确认时的共同保温区间 "
+                    f"{load['hold_min']} ~ {load['hold_max']} 分钟内"
+                    "（以确认清单快照为准，批次后来的修改不算数）",
+                    allowed_hold_min=load["hold_min"],
+                    allowed_hold_max=load["hold_max"],
+                )
+
+            existing = db.execute(
+                "SELECT id FROM firing_schedules WHERE load_id = ?", (load_id,)
+            ).fetchone()
+
+            # 同窑时间段重叠重查（半开区间 [start, end)，首尾相接允许）：
+            # 排除自身；冲突信息指出占用窑次。
+            conflicts = db.execute(
+                """SELECT fs.id, fs.load_id, cl.name AS load_name,
+                          fs.start_at, fs.end_at, fs.start_utc, fs.end_utc
+                     FROM firing_schedules fs
+                     JOIN confirmed_loads cl ON cl.id = fs.load_id
+                    WHERE fs.kiln_id = ? AND fs.load_id <> ?
+                      AND fs.start_utc < ? AND fs.end_utc > ?
+                 ORDER BY fs.start_utc""",
+                (load["kiln_id"], load_id, end_utc, start_utc),
+            ).fetchall()
+            if conflicts:
+                parts = [
+                    f"窑次 #{r['load_id']}（{r['load_name']}，{r['start_at']} ~ {r['end_at']}）"
+                    for r in conflicts
+                ]
+                db.rollback()
+                return err(
+                    409,
+                    f"{load['kiln_code']} 在该时段已被占用，冲突安排："
+                    + "；".join(parts)
+                    + "。首尾相接或换一台窑可以，本次保存未生效，原安排保持不变。",
+                    conflict=True,
+                    conflict_load_ids=[r["load_id"] for r in conflicts],
+                )
+
+            if existing is None:
+                db.execute(
+                    """INSERT INTO firing_schedules
+                           (load_id, kiln_id, start_at, end_at, start_utc, end_utc,
+                            peak_temp, hold_minutes)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        load_id,
+                        load["kiln_id"],
+                        data["start_at"].strip(),
+                        data["end_at"].strip(),
+                        start_utc,
+                        end_utc,
+                        float(peak),
+                        hold,
+                    ),
+                )
+                created = True
+            else:
+                # 修改：同一窑次只保留一条安排，整体替换时段与参数
+                db.execute(
+                    """UPDATE firing_schedules
+                          SET start_at = ?, end_at = ?, start_utc = ?, end_utc = ?,
+                              peak_temp = ?, hold_minutes = ?,
+                              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                        WHERE load_id = ?""",
+                    (
+                        data["start_at"].strip(),
+                        data["end_at"].strip(),
+                        start_utc,
+                        end_utc,
+                        float(peak),
+                        hold,
+                        load_id,
+                    ),
+                )
+                created = False
+            db.commit()
+        except sqlite3.IntegrityError:
+            # UNIQUE(load_id)：并发下另一事务已为该窑次建立安排
+            db.rollback()
+            return err(
+                409,
+                f"窑次 #{load_id} 的烧成安排刚被他人建立，请刷新后在原安排上修改",
+                conflict=True,
+            )
+
+        row = db.execute(
+            SCHEDULE_SELECT + " WHERE fs.load_id = ?", (load_id,)
+        ).fetchone()
+        body = schedule_json(row)
+        body["created"] = created
+        return jsonify(body), (201 if created else 200)
 
     return app

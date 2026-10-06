@@ -53,6 +53,32 @@ python wsgi.py        # 或：flask --app wsgi run --host 0.0.0.0 --port 8000
    并由 `confirmed_load_items.batch_id` 的全局唯一约束兜底——只有一个确认能成功，另一个收到冲突提示。
 8. **重启保留**：数据持久化在 SQLite 文件（Docker 卷 `/data/kiln.db`，WAL 模式），重启后已确认清单按快照正常查询。
 
+## 烧成时段安排（页面第 ④ 区）
+
+装窑确认之后，在页面底部 **“④ 烧成时段安排”** 给已确认窑次排烧成时段：
+
+1. **选窑次**：从下拉框选择一条**已确认窑次**（带 `［未安排］/［已安排］` 标记），
+   窑炉与该窑次确认时的共同峰温/保温区间会自动带出且只读。
+2. **填时间**：开始、结束各由“本地日期时间 + 时区下拉”组成，提交为带偏移的
+   ISO 8601（如 `2026-10-20T10:00:00+08:00`，UTC 选 `Z`）；开始必须严格早于结束。
+3. **填工艺参数**：拟用峰温（数字）与保温分钟（整数）必须落在**该窑次确认时的共同区间内**，
+   即确认清单头 `peak_min~peak_max / hold_min~hold_max` 的快照；批次之后修改的范围**不作数**。
+4. **保存**：同一窑次只能安排一次——未安排时为新建，已安排时点“修改时段/参数”
+   或再次保存为**原地更新**（不产生第二条）。服务器在 `BEGIN IMMEDIATE` 事务内按
+   **数据库中的最新安排**重新检查：
+   - 时间先后、时区合法性；
+   - 参数在确认快照区间内（错误信息回带允许上下界）；
+   - **同一台窑的时间段不得重叠**（按归一化 UTC 比较，半开区间 `[start, end)`），
+     冲突返回 `409` 并**指出占用窑次编号、名称与时段**；
+   - **首尾相接允许**（前段结束 = 后段开始不算冲突）；**不同窑同一时段可同时烧成**。
+
+   任一检查失败，本次请求不写入任何内容，**原安排保持不变**；两个请求并发争用同窑同一时段时，
+   由事务串行化保证**只有一个成功**。
+5. **按窑展示**：页面按窑分列、窑内按开始时间（UTC）排序展示全部安排，
+   同时给出带时区的本地时间与 UTC 参考时间；点“修改时段/参数”可再次编辑，“取消修改”放弃编辑态。
+6. 安排保存在独立的 `firing_schedules` 表，**不改动任何已确认装载快照**
+   （`confirmed_loads / confirmed_load_items` 依旧只增不改），随 Docker 卷持久化，重启后保留。
+
 ## 主要 HTTP API
 
 | 方法 | 路径 | 说明 |
@@ -66,7 +92,19 @@ python wsgi.py        # 或：flask --app wsgi run --host 0.0.0.0 --port 8000
 | DELETE | `/api/drafts/{id}/items/{batch_id}` | 移出批次 |
 | GET | `/api/drafts/{id}/preview` | 只读预览共同区间、占位、冲突 |
 | POST | `/api/drafts/{id}/confirm` | 携带 `{draft_version, items:[{batch_id,batch_version,pos_no}]}` 确认 |
-| GET | `/api/loads`、`/api/loads/{id}` | 已确认窑次列表 / 快照详情 |
+| GET | `/api/loads`、`/api/loads/{id}` | 已确认窑次列表（含 `schedule_id`）/ 快照详情 |
+| GET | `/api/schedules` | 全部烧成安排，按窑、开始时间排序（含确认快照允许区间） |
+| PUT | `/api/schedules/loads/{load_id}` | 为已确认窑次新建/修改安排 `{start_at, end_at, peak_temp, hold_minutes}`，时间须带时区 |
+
+烧成安排冲突返回示例：
+
+```json
+{
+  "error": "K1 在该时段已被占用，冲突安排：窑次 #2（L2，2026-10-11T09:00:00+08:00 ~ 2026-10-11T10:00:00+08:00）。首尾相接或换一台窑可以，本次保存未生效，原安排保持不变。",
+  "conflict": true,
+  "conflict_load_ids": [2]
+}
+```
 
 过期预览确认返回示例：
 
@@ -81,7 +119,9 @@ Dockerfile / docker-compose.yml   一键启动
 wsgi.py                           gunicorn 入口
 schema.sql                        建表脚本（启动时自动执行）
 requirements.txt
-app/__init__.py                   Flask 路由、预览与确认事务
+app/__init__.py                   Flask 路由、预览/确认事务、烧成时段安排事务
 app/db.py                         SQLite 连接/初始化、固定窑位种子数据
 app/static/                       原生前端（index.html / app.js / styles.css）
+test_e2e.py / test_concurrent.py            装窑确认端到端 / 并发争用
+test_schedules.py / test_schedule_concurrent.py  烧成安排端到端 / 同窑时段并发争用
 ```

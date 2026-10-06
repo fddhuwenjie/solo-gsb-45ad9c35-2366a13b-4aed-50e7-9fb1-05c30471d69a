@@ -100,3 +100,27 @@ td button { padding: 3px 8px; font-size: 12px; background: #a85a43; }
 .toast.err { background: #c0392b; }
 .toast.info { background: #2f6d8f; }
 .hidden { display: none; }
+
+/* 烧成时段安排 */
+.schedule-form {
+  display: flex; flex-wrap: wrap; gap: 10px; align-items: end;
+}
+.schedule-form label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: #75695a; }
+.schedule-form input[readonly] { background: #f3f1ec; color: #5a5044; }
+.sched-board {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 12px; margin-top: 12px;
+}
+.kiln-col h3 {
+  margin: 0 0 8px; font-size: 14px; color: #7a3b24;
+  border-bottom: 2px solid #e4dccd; padding-bottom: 6px;
+}
+.sched-item {
+  border: 1px solid #d8cfbd; border-left: 4px solid #2f6d8f; border-radius: 8px;
+  padding: 8px 10px; margin-bottom: 8px; background: #faf8f3; font-size: 12.5px;
+}
+.sched-item .s-title { font-weight: bold; font-size: 13.5px; }
+.sched-item .s-meta { color: #5a5044; margin-top: 3px; }
+.sched-item .s-utc { color: #8a8175; font-size: 11.5px; margin-top: 2px; }
+.sched-item button { margin-top: 6px; padding: 3px 10px; font-size: 12px; background: #2f6d8f; }
+.sched-empty { color: #8a8175; font-size: 12.5px; padding: 4px 0; }

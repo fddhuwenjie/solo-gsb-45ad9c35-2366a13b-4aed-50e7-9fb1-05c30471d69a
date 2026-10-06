@@ -9,6 +9,8 @@ const state = {
   preview: null,        // 最近一次预览结果
   loads: [],
   openLoadId: null,
+  schedules: [],
+  editingLoadId: null,  // 正在修改的已安排窑次；null = 新安排
 };
 
 const $ = (id) => document.getElementById(id);
@@ -78,6 +80,7 @@ async function reloadDrafts(selectId) {
 async function reloadLoads() {
   state.loads = await api("GET", "/api/loads");
   renderLoads();
+  if ($("sc-load")) renderLoadScheduleOptions();
 }
 
 // ---------------- 批次 ----------------
@@ -427,11 +430,203 @@ function renderLoads() {
 
 $("loads-refresh").addEventListener("click", reloadLoads);
 
+// ---------------- 烧成时段安排 ----------------
+
+const SCHED_TZ_OPTIONS = [
+  ["+08:00", "UTC+08:00（北京）"],
+  ["+09:00", "UTC+09:00（东京）"],
+  ["+07:00", "UTC+07:00（曼谷）"],
+  ["+05:30", "UTC+05:30（印度）"],
+  ["+00:00", "UTC+00:00（伦敦）"],
+  ["-05:00", "UTC-05:00（纽约）"],
+  ["-08:00", "UTC-08:00（旧金山）"],
+];
+
+function buildTzOptions(sel) {
+  sel.innerHTML = SCHED_TZ_OPTIONS
+    .map(([v, label]) => `<option value="${v}">${label}</option>`)
+    .join("");
+  sel.value = "+08:00";
+}
+
+async function reloadSchedules() {
+  state.schedules = await api("GET", "/api/schedules");
+  renderScheduleBoard();
+  renderLoadScheduleOptions();
+  fillScheduleFormFromSelection();
+}
+
+function scheduleForLoad(loadId) {
+  return state.schedules.find((s) => s.load_id === loadId) || null;
+}
+
+// 把带时区 ISO 8601 拆成本地墙钟值（datetime-local）与 UTC 偏移
+function splitZonedIso(iso) {
+  const m = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?)(Z|[+-]\d{2}:?\d{2})$/.exec(iso.trim());
+  if (!m) return null;
+  let off = m[3] === "Z" ? "+00:00" : m[3];
+  if (off.length === 5) off = `${off.slice(0, 3)}:${off.slice(3)}`;
+  return { local: `${m[1]}T${m[2]}`, offset: off };
+}
+
+function buildZonedIso(localValue, offset) {
+  // localValue: YYYY-MM-DDTHH:mm[:ss]；offset: +HH:MM
+  return `${localValue}${offset === "+00:00" ? "Z" : offset}`;
+}
+
+function renderLoadScheduleOptions() {
+  const sel = $("sc-load");
+  if (!state.loads.length) {
+    sel.innerHTML = `<option value="">（暂无已确认窑次）</option>`;
+    return;
+  }
+  sel.innerHTML = state.loads.map((l) => {
+    const sched = scheduleForLoad(l.id);
+    const tag = sched ? "［已安排］" : "［未安排］";
+    return `<option value="${l.id}">${tag} #${l.id} ${esc(l.name)}（${esc(l.kiln_code)}）</option>`;
+  }).join("");
+  // 保持正在修改的选择；否则选第一个未安排窑次
+  const keep = state.editingLoadId;
+  if (keep && state.loads.some((l) => l.id === keep)) {
+    sel.value = String(keep);
+  } else {
+    const firstUnsched = state.loads.find((l) => !scheduleForLoad(l.id));
+    sel.value = String(firstUnsched ? firstUnsched.id : state.loads[0].id);
+  }
+}
+
+function fillScheduleFormFromSelection() {
+  const loadId = Number($("sc-load").value);
+  const load = state.loads.find((l) => l.id === loadId);
+  const sched = loadId ? scheduleForLoad(loadId) : null;
+  if (!load) {
+    $("sc-kiln").value = "";
+    $("sc-peak-range").value = "";
+    $("sc-hold-range").value = "";
+    return;
+  }
+  $("sc-kiln").value = load.kiln_code;
+  $("sc-peak-range").value = `${load.peak_min} ~ ${load.peak_max} °C`;
+  $("sc-hold-range").value = `${load.hold_min} ~ ${load.hold_max} min`;
+
+  state.editingLoadId = sched ? load.id : null;
+  if (sched) {
+    const s = splitZonedIso(sched.start_at);
+    const e = splitZonedIso(sched.end_at);
+    if (s) { $("sc-start").value = s.local; $("sc-tz-start").value = s.offset; }
+    if (e) { $("sc-end").value = e.local; $("sc-tz-end").value = e.offset; }
+    $("sc-peak").value = sched.peak_temp;
+    $("sc-hold").value = sched.hold_minutes;
+  } else {
+    $("sc-start").value = "";
+    $("sc-end").value = "";
+    $("sc-peak").value = "";
+    $("sc-hold").value = "";
+  }
+  $("sc-submit").textContent = sched ? "保存修改（同一窑次）" : "保存安排";
+  $("sc-cancel").classList.toggle("hidden", !sched);
+  $("sc-hint").textContent = sched
+    ? `正在修改窑次 #${load.id} 的既有安排；保存冲突时原安排保持不变。`
+    : "新安排的工艺参数必须落在确认时共同区间内。";
+}
+
+$("sc-load").addEventListener("change", fillScheduleFormFromSelection);
+$("sc-cancel").addEventListener("click", () => {
+  state.editingLoadId = null;
+  renderLoadScheduleOptions();
+  fillScheduleFormFromSelection();
+});
+
+$("schedule-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const loadId = Number($("sc-load").value);
+  if (!loadId) { toast("请先确认装窑生成窑次，再安排烧成时段", "err"); return; }
+  const lv = $("sc-start").value;
+  const evv = $("sc-end").value;
+  if (!lv || !evv) { toast("请填写开始与结束时间", "err"); return; }
+  const body = {
+    start_at: buildZonedIso(lv, $("sc-tz-start").value),
+    end_at: buildZonedIso(evv, $("sc-tz-end").value),
+    peak_temp: Number($("sc-peak").value),
+    hold_minutes: parseInt($("sc-hold").value, 10),
+  };
+  try {
+    const saved = await api("PUT", `/api/schedules/loads/${loadId}`, body);
+    toast(saved.created
+      ? `窑次 #${loadId} 烧成时段已安排`
+      : `窑次 #${loadId} 烧成安排已更新`, "ok");
+    state.editingLoadId = null;
+    await reloadSchedules();
+    await reloadLoads();
+    renderLoadScheduleOptions();
+    // 保存后停留在该窑次（展示最新值）
+    $("sc-load").value = String(loadId);
+    fillScheduleFormFromSelection();
+  } catch (e) {
+    // 冲突/参数越界/时间非法：后端未写入，表单保留原值，刷新出最新安排供核对
+    toast(e.message, "err");
+    try {
+      await reloadSchedules();
+    } catch (_) { /* ignore */ }
+  }
+});
+
+$("sc-refresh").addEventListener("click", async () => {
+  try {
+    await Promise.all([reloadLoads(), reloadSchedules()]);
+    toast("烧成安排已刷新", "ok");
+  } catch (e) { toast(e.message, "err"); }
+});
+
+function fmtZoned(iso) {
+  const parts = splitZonedIso(iso);
+  if (!parts) return esc(iso);
+  const off = parts.offset;
+  return `${parts.local.replace("T", " ").slice(0, 19)} <span class="s-utc">${off === "+00:00" ? "Z" : off}</span>`;
+}
+
+function renderScheduleBoard() {
+  const board = $("schedule-board");
+  if (!state.kilns.length) { board.innerHTML = ""; return; }
+  board.innerHTML = state.kilns.map((k) => {
+    const items = state.schedules
+      .filter((s) => s.kiln_id === k.id)
+      .sort((a, b) => a.start_utc < b.start_utc ? -1 : a.start_utc > b.start_utc ? 1 : a.id - b.id);
+    return `<div class="kiln-col">
+      <h3>${esc(k.code)} · ${esc(k.name)}</h3>
+      ${items.length ? items.map((s) => `
+        <div class="sched-item">
+          <div class="s-title">窑次 #${s.load_id} · ${esc(s.load_name)}</div>
+          <div class="s-meta">开始：${fmtZoned(s.start_at)}</div>
+          <div class="s-meta">结束：${fmtZoned(s.end_at)}</div>
+          <div class="s-meta">峰温 <b>${s.peak_temp} °C</b>（允许 ${s.allowed_peak_min}~${s.allowed_peak_max}）·
+            保温 <b>${s.hold_minutes} min</b>（允许 ${s.allowed_hold_min}~${s.allowed_hold_max}）</div>
+          <div class="s-utc">UTC ${s.start_utc} ~ ${s.end_utc}；更新于 ${new Date(s.updated_at).toLocaleString()}</div>
+          <button data-edit-sched="${s.load_id}">修改时段/参数</button>
+        </div>`).join("")
+        : `<div class="sched-empty">暂无安排（可与其他窑同时烧成）</div>`}
+    </div>`;
+  }).join("");
+
+  board.querySelectorAll("[data-edit-sched]").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      const loadId = Number(btn.dataset.editSched);
+      state.editingLoadId = loadId;
+      renderLoadScheduleOptions();
+      $("sc-load").value = String(loadId);
+      fillScheduleFormFromSelection();
+      $("schedule-form").scrollIntoView({ behavior: "smooth", block: "center" });
+    })
+  );
+}
+
 // ---------------- 启动 ----------------
 
 (async function init() {
   try {
-    await Promise.all([reloadKilns(), reloadBatches(), reloadLoads()]);
+    buildTzOptions($("sc-tz-start"));
+    buildTzOptions($("sc-tz-end"));
+    await Promise.all([reloadKilns(), reloadBatches(), reloadLoads(), reloadSchedules()]);
     await reloadDrafts();
   } catch (e) {
     toast("初始化失败：" + e.message, "err");
