@@ -9,7 +9,7 @@
 <body>
   <header>
     <h1>陶瓷合窑装载确认台</h1>
-    <div class="sub">登记待烧批次 · 装窑草案预览 · 版本校验后确认 · 已确认清单不可变</div>
+    <div class="sub">登记待烧批次 · 装窑草案预览 · 版本校验后确认 · 已确认清单不可变 · 烧成时段安排</div>
   </header>
 
   <div id="toast" class="toast hidden"></div>
@@ -90,6 +90,37 @@
       <h2>③ 已确认窑次（快照）</h2>
       <button id="loads-refresh" class="secondary">刷新</button>
       <div id="load-list"></div>
+    </section>
+
+    <!-- 右列：烧成时段安排 -->
+    <section class="card">
+      <h2>④ 烧成时段安排</h2>
+      <form id="sched-form" class="row-form">
+        <label>窑次
+          <select id="s-load"></select>
+        </label>
+        <label>开始
+          <input id="s-start" type="datetime-local" step="1" required />
+        </label>
+        <label>结束
+          <input id="s-end" type="datetime-local" step="1" required />
+        </label>
+        <label>拟用峰温 °C
+          <input id="s-peak" type="number" step="1" required style="width:80px" />
+        </label>
+        <label>保温 分钟
+          <input id="s-hold" type="number" step="1" required style="width:70px" />
+        </label>
+        <button type="submit" id="s-save">保存安排</button>
+        <button type="button" id="s-cancel" class="secondary hidden">取消修改</button>
+      </form>
+      <div id="s-range" class="hint"></div>
+      <p class="hint">
+        时间按本机时区选择，提交时自动携带时区偏移；同一窑次只能安排一次，
+        同一台窑的时段不得重叠（首尾相接允许，不同窑可同时烧成）。
+        拟用峰温/保温须落在该窑次<strong>确认时</strong>的共同区间内。
+      </p>
+      <div id="sched-list"></div>
     </section>
   </main>
 

@@ -9,6 +9,8 @@ const state = {
   preview: null,        // 最近一次预览结果
   loads: [],
   openLoadId: null,
+  schedules: [],        // 全部烧成时段安排
+  editingScheduleId: null, // 正在修改的安排 id（null = 新建）
 };
 
 const $ = (id) => document.getElementById(id);
@@ -78,6 +80,13 @@ async function reloadDrafts(selectId) {
 async function reloadLoads() {
   state.loads = await api("GET", "/api/loads");
   renderLoads();
+  renderLoadOptions();
+}
+
+async function reloadSchedules() {
+  state.schedules = await api("GET", "/api/schedules");
+  renderSchedules();
+  renderLoadOptions();
 }
 
 // ---------------- 批次 ----------------
@@ -427,11 +436,174 @@ function renderLoads() {
 
 $("loads-refresh").addEventListener("click", reloadLoads);
 
+// ---------------- 烧成时段安排 ----------------
+
+// datetime-local 值 -> 带时区偏移的 ISO（按本机时区，如 2026-10-08T08:00:00+08:00）
+function localInputToIso(v) {
+  if (!v) return null;
+  const d = new Date(v);
+  if (isNaN(d)) return null;
+  const offMin = -d.getTimezoneOffset();
+  const sign = offMin >= 0 ? "+" : "-";
+  const pad = (n) => String(Math.abs(n)).padStart(2, "0");
+  const local = new Date(d.getTime() - d.getTimezoneOffset() * 60000);
+  return (
+    local.toISOString().slice(0, 19) +
+    sign + pad(Math.floor(offMin / 60)) + ":" + pad(offMin % 60)
+  );
+}
+
+// 服务器存的 UTC ISO -> datetime-local 值（本机时区）
+function isoToLocalInput(iso) {
+  const d = new Date(iso);
+  const local = new Date(d.getTime() - d.getTimezoneOffset() * 60000);
+  return local.toISOString().slice(0, 16);
+}
+
+const fmtTime = (iso) => new Date(iso).toLocaleString();
+
+// 尚未安排的已确认窑次（修改时额外包含当前安排对应的窑次）
+function schedulableLoads() {
+  const scheduled = new Map(state.schedules.map((s) => [s.load_id, s.id]));
+  return state.loads.filter(
+    (l) =>
+      !scheduled.has(l.id) ||
+      (state.editingScheduleId && scheduled.get(l.id) === state.editingScheduleId)
+  );
+}
+
+function renderLoadOptions() {
+  const sel = $("s-load");
+  if (!sel) return;
+  const loads = schedulableLoads();
+  sel.innerHTML = loads.length
+    ? loads
+        .map(
+          (l) =>
+            `<option value="${l.id}">窑次 #${l.id} · ${esc(l.name)}（${esc(l.kiln_code)}）</option>`
+        )
+        .join("")
+    : `<option value="">（没有可安排的已确认窑次）</option>`;
+  if (state.editingScheduleId) {
+    const cur = state.schedules.find((s) => s.id === state.editingScheduleId);
+    if (cur) sel.value = String(cur.load_id);
+    sel.disabled = true;
+  } else {
+    sel.disabled = !loads.length;
+  }
+  updateRangeHint();
+}
+
+function updateRangeHint() {
+  const id = Number($("s-load").value);
+  const l = state.loads.find((x) => x.id === id);
+  $("s-range").textContent = l
+    ? `窑次 #${l.id} 确认时共同区间：峰温 ${l.peak_min} ~ ${l.peak_max} °C，` +
+      `保温 ${l.hold_min} ~ ${l.hold_max} 分钟（拟用参数须落在该区间内）`
+    : "";
+}
+
+function renderSchedules() {
+  const box = $("sched-list");
+  if (!state.schedules.length) {
+    box.innerHTML = `<p style="color:#8a8175;font-size:13px">尚无烧成安排</p>`;
+    return;
+  }
+  // 按窑分组，组内按开始时间排序（接口已按此顺序返回）
+  const byKiln = new Map();
+  for (const s of state.schedules) {
+    if (!byKiln.has(s.kiln_code)) byKiln.set(s.kiln_code, []);
+    byKiln.get(s.kiln_code).push(s);
+  }
+  box.innerHTML = [...byKiln.entries()]
+    .map(
+      ([kiln, list]) => `
+      <h3>窑 ${esc(kiln)}</h3>
+      ${list
+        .map(
+          (s) => `
+        <div class="sched-item${s.id === state.editingScheduleId ? " editing" : ""}">
+          <div class="title">窑次 #${s.load_id} · ${esc(s.load_name)}</div>
+          <div class="meta">${fmtTime(s.start_at)} → ${fmtTime(s.end_at)}</div>
+          <div class="meta">拟用峰温 ${s.peak_temp} °C · 保温 ${s.hold_minutes} 分钟</div>
+          <button data-edit-sched="${s.id}">修改</button>
+        </div>`
+        )
+        .join("")}`
+    )
+    .join("");
+
+  box.querySelectorAll("[data-edit-sched]").forEach((btn) =>
+    btn.addEventListener("click", () => startEditSchedule(Number(btn.dataset.editSched)))
+  );
+}
+
+function startEditSchedule(id) {
+  const s = state.schedules.find((x) => x.id === id);
+  if (!s) return;
+  state.editingScheduleId = id;
+  renderLoadOptions();
+  $("s-start").value = isoToLocalInput(s.start_at);
+  $("s-end").value = isoToLocalInput(s.end_at);
+  $("s-peak").value = s.peak_temp;
+  $("s-hold").value = s.hold_minutes;
+  $("s-save").textContent = "保存修改";
+  $("s-cancel").classList.remove("hidden");
+  renderSchedules();
+}
+
+function resetSchedForm() {
+  state.editingScheduleId = null;
+  $("sched-form").reset();
+  $("s-save").textContent = "保存安排";
+  $("s-cancel").classList.add("hidden");
+  renderLoadOptions();
+  renderSchedules();
+}
+
+$("s-load").addEventListener("change", updateRangeHint);
+$("s-cancel").addEventListener("click", resetSchedForm);
+
+$("sched-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const payload = {
+    start_at: localInputToIso($("s-start").value),
+    end_at: localInputToIso($("s-end").value),
+    peak_temp: Number($("s-peak").value),
+    hold_minutes: parseInt($("s-hold").value, 10),
+  };
+  if (!payload.start_at || !payload.end_at) {
+    toast("请填写完整的开始与结束时间", "err");
+    return;
+  }
+  try {
+    if (state.editingScheduleId) {
+      await api("PUT", `/api/schedules/${state.editingScheduleId}`, payload);
+      toast("安排已更新", "ok");
+    } else {
+      const loadId = Number($("s-load").value);
+      if (!loadId) {
+        toast("没有可安排的已确认窑次，请先在 ② 中确认装窑", "err");
+        return;
+      }
+      const s = await api("POST", "/api/schedules", { load_id: loadId, ...payload });
+      toast(`窑次 #${s.load_id} 烧成时段已保存`, "ok");
+    }
+    resetSchedForm();
+    await reloadSchedules();
+  } catch (e) {
+    // 冲突（如同窑时段重叠、窑次已安排）：服务器已指出占用窑次；
+    // 失败后原安排保持不变，刷新列表以数据库最新数据为准
+    toast(e.message, "err");
+    await reloadSchedules();
+  }
+});
+
 // ---------------- 启动 ----------------
 
 (async function init() {
   try {
-    await Promise.all([reloadKilns(), reloadBatches(), reloadLoads()]);
+    await Promise.all([reloadKilns(), reloadBatches(), reloadLoads(), reloadSchedules()]);
     await reloadDrafts();
   } catch (e) {
     toast("初始化失败：" + e.message, "err");

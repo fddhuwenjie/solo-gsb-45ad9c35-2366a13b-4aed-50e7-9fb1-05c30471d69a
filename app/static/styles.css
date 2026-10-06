@@ -15,11 +15,12 @@ header .sub { font-size: 13px; opacity: 0.85; margin-top: 4px; }
 
 .grid {
   display: grid;
-  grid-template-columns: 1fr 1.3fr 1fr;
+  grid-template-columns: 1fr 1.2fr 1fr 1.1fr;
   gap: 16px;
   padding: 16px;
   align-items: start;
 }
+@media (max-width: 1400px) { .grid { grid-template-columns: 1fr 1fr; } }
 @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
 
 .card {
@@ -90,6 +91,15 @@ td button { padding: 3px 8px; font-size: 12px; background: #a85a43; }
 .load-item .meta { font-size: 12px; color: #75695a; margin-top: 3px; }
 .load-detail { font-size: 12px; margin-top: 8px; }
 .load-detail table { font-size: 12px; }
+
+.sched-item {
+  border: 1px solid #e4dccd; border-radius: 8px; padding: 10px; margin-bottom: 8px;
+  background: #faf8f3; font-size: 13px;
+}
+.sched-item .title { font-weight: bold; font-size: 13px; }
+.sched-item .meta { font-size: 12px; color: #75695a; margin-top: 2px; }
+.sched-item button { margin-top: 6px; padding: 3px 10px; font-size: 12px; background: #2f6d8f; }
+.sched-item.editing { border-color: #2f6d8f; background: #eef4f8; }
 
 .toast {
   position: fixed; top: 16px; left: 50%; transform: translateX(-50%);

@@ -6,10 +6,16 @@
 - 确认在单个 SQLite 事务内重查全部条件（窑位不重复、两区间均有交集、
   批次未被其他已确认窑次占用），任一失败整体不改动；
 - confirmed_* 表只增不改，批次被某窑次占用由 UNIQUE(batch_id) 保证，
-  并发争用同一批次时只有一个事务能提交。
+  并发争用同一批次时只有一个事务能提交；
+- 烧成时段安排：仅面向已确认窑次，同一窑次只能安排一次；拟用峰温/保温
+  必须落在该窑次确认时快照的共同区间内（不取批次后续修改的范围）；
+  保存时在 BEGIN IMMEDIATE 事务内按数据库最新安排重查——同一台窑的
+  时间段不得重叠（首尾相接允许），冲突指出占用窑次，失败则原安排不变，
+  同窑并发争用同一时段只有一个事务能提交。
 """
 import numbers
 import sqlite3
+from datetime import datetime, timezone
 
 from flask import Flask, jsonify, request, send_from_directory
 
@@ -705,5 +711,228 @@ def create_app():
     @app.route("/api/loads/<int:load_id>", methods=["GET"])
     def get_load(load_id):
         return load_detail(get_db(), load_id)
+
+    # ------------------------------------------------------------------
+    # 烧成时段安排（对已确认窑次；保存时事务内按最新数据重查）
+    # ------------------------------------------------------------------
+
+    SCHEDULE_SELECT = """
+        SELECT fs.id, fs.load_id, cl.name AS load_name, fs.kiln_id, k.code AS kiln_code,
+               fs.start_at, fs.end_at, fs.peak_temp, fs.hold_minutes,
+               fs.created_at, fs.updated_at
+          FROM firing_schedules fs
+          JOIN confirmed_loads cl ON cl.id = fs.load_id
+          JOIN kilns k ON k.id = fs.kiln_id
+    """
+
+    def parse_iso_tz(value, name):
+        """解析带时区的 ISO 8601 时间并转为 UTC。返回 (datetime, None) 或 (None, 错误)。"""
+        if not isinstance(value, str) or not value.strip():
+            return None, f"{name}不能为空"
+        s = value.strip()
+        if s[-1:] in ("Z", "z"):
+            s = s[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(s)
+        except ValueError:
+            return None, f"{name}不是合法的 ISO 8601 日期时间"
+        if dt.tzinfo is None:
+            return None, f"{name}必须带时区（如 2026-10-08T08:00:00+08:00）"
+        return dt.astimezone(timezone.utc), None
+
+    def fmt_utc(dt):
+        """UTC 时间 -> 定长 ISO 字符串（字典序即时间序），如 2026-10-08T00:00:00.000000Z。"""
+        return dt.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+    def parse_schedule_fields(data):
+        """解析时段与拟用工艺参数。返回 ((start, end, peak, hold), None) 或 (None, 错误)。"""
+        start, e = parse_iso_tz(data.get("start_at"), "开始时间")
+        if e:
+            return None, e
+        end, e = parse_iso_tz(data.get("end_at"), "结束时间")
+        if e:
+            return None, e
+        if not start < end:
+            return None, "时间须先后有序：开始时间必须早于结束时间"
+        peak = data.get("peak_temp")
+        hold = data.get("hold_minutes")
+        if isinstance(peak, bool) or not isinstance(peak, numbers.Real):
+            return None, "拟用峰温必须是数字"
+        if isinstance(hold, bool) or not isinstance(hold, int):
+            return None, "保温分钟必须是整数"
+        if peak < 0 or hold < 0:
+            return None, "拟用峰温与保温分钟不能为负数"
+        return (start, end, peak, hold), None
+
+    def params_range_error(load, peak, hold):
+        """拟用参数必须落在该窑次确认时快照的共同区间内（不取批次后续修改的范围）。"""
+        if not load["peak_min"] <= peak <= load["peak_max"]:
+            return (
+                f"拟用峰温 {peak}°C 不在窑次 #{load['id']} 确认时的共同峰温区间 "
+                f"[{load['peak_min']}, {load['peak_max']}] 内（以确认快照为准，不取批次后续修改）"
+            )
+        if not load["hold_min"] <= hold <= load["hold_max"]:
+            return (
+                f"保温 {hold} 分钟不在窑次 #{load['id']} 确认时的共同保温区间 "
+                f"[{load['hold_min']}, {load['hold_max']}] 内（以确认快照为准，不取批次后续修改）"
+            )
+        return None
+
+    def find_overlaps(db, kiln_id, start, end, exclude_id=None):
+        """同一台窑的重叠安排（首尾相接不算重叠）。须在事务内调用以读到最新数据。"""
+        q = (
+            "SELECT fs.id, fs.load_id, fs.start_at, fs.end_at, cl.name AS load_name"
+            "  FROM firing_schedules fs"
+            "  JOIN confirmed_loads cl ON cl.id = fs.load_id"
+            " WHERE fs.kiln_id = ?"
+        )
+        args = [kiln_id]
+        if exclude_id is not None:
+            q += " AND fs.id != ?"
+            args.append(exclude_id)
+        overlaps = []
+        for r in db.execute(q, args):
+            s, _ = parse_iso_tz(r["start_at"], "开始时间")
+            e, _ = parse_iso_tz(r["end_at"], "结束时间")
+            if s < end and start < e:
+                overlaps.append(
+                    {
+                        "schedule_id": r["id"],
+                        "load_id": r["load_id"],
+                        "load_name": r["load_name"],
+                        "start_at": r["start_at"],
+                        "end_at": r["end_at"],
+                    }
+                )
+        return overlaps
+
+    def overlap_error(overlaps):
+        parts = [
+            f"窑次 #{o['load_id']}（{o['load_name']}）{o['start_at']} ~ {o['end_at']}"
+            for o in overlaps
+        ]
+        return err(
+            409,
+            "同一台窑的烧成时段重叠，占用窑次：" + "；".join(parts),
+            conflicts=overlaps,
+        )
+
+    def schedule_detail(db, schedule_id, created=False):
+        row = db.execute(
+            SCHEDULE_SELECT + " WHERE fs.id = ?", (schedule_id,)
+        ).fetchone()
+        if row is None:
+            return err(404, "烧成安排不存在")
+        return jsonify(dict(row)), (201 if created else 200)
+
+    @app.route("/api/schedules", methods=["GET"])
+    def list_schedules():
+        """全部安排：按窑和开始时间排序。"""
+        db = get_db()
+        rows = db.execute(
+            SCHEDULE_SELECT + " ORDER BY fs.kiln_id, fs.start_at, fs.id"
+        ).fetchall()
+        return jsonify([dict(r) for r in rows])
+
+    @app.route("/api/schedules", methods=["POST"])
+    def create_schedule():
+        data = json_body()
+        load_id = data.get("load_id")
+        if isinstance(load_id, bool) or not isinstance(load_id, int):
+            return err(400, "需要 load_id（整数）：从已确认窑次清单中选择")
+        parsed, e = parse_schedule_fields(data)
+        if e:
+            return err(400, e)
+        start, end, peak, hold = parsed
+
+        db = get_db()
+        try:
+            # BEGIN IMMEDIATE：并发安排在此排队，重查与写入原子完成
+            db.execute("BEGIN IMMEDIATE")
+            load = db.execute(
+                "SELECT * FROM confirmed_loads WHERE id = ?", (load_id,)
+            ).fetchone()
+            if load is None:
+                db.rollback()
+                return err(404, "窑次不存在（仅已确认窑次可安排烧成）")
+            dup = db.execute(
+                "SELECT id FROM firing_schedules WHERE load_id = ?", (load_id,)
+            ).fetchone()
+            if dup:
+                db.rollback()
+                return err(
+                    409,
+                    f"窑次 #{load_id} 已安排过烧成时段（安排 #{dup['id']}），"
+                    "同一窑次只能安排一次；如需调整请修改原安排",
+                    conflict_schedule=dup["id"],
+                )
+            e = params_range_error(load, peak, hold)
+            if e:
+                db.rollback()
+                return err(400, e)
+            overlaps = find_overlaps(db, load["kiln_id"], start, end)
+            if overlaps:
+                db.rollback()
+                return overlap_error(overlaps)
+            cur = db.execute(
+                """INSERT INTO firing_schedules
+                       (load_id, kiln_id, start_at, end_at, peak_temp, hold_minutes)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (load_id, load["kiln_id"], fmt_utc(start), fmt_utc(end), peak, hold),
+            )
+            db.commit()
+        except sqlite3.IntegrityError:
+            # UNIQUE(load_id)：并发争用同一窑次时的落败方
+            db.rollback()
+            return err(
+                409,
+                "并发冲突：该窑次已被另一请求抢先安排，请刷新后查看",
+                conflict=True,
+            )
+        return schedule_detail(db, cur.lastrowid, created=True)
+
+    @app.route("/api/schedules/<int:schedule_id>", methods=["PUT"])
+    def update_schedule(schedule_id):
+        """修改已有安排的时段与参数；任一检查失败则回滚，原安排保持不变。"""
+        data = json_body()
+        parsed, e = parse_schedule_fields(data)
+        if e:
+            return err(400, e)
+        start, end, peak, hold = parsed
+
+        db = get_db()
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            sched = db.execute(
+                "SELECT * FROM firing_schedules WHERE id = ?", (schedule_id,)
+            ).fetchone()
+            if sched is None:
+                db.rollback()
+                return err(404, "烧成安排不存在")
+            load = db.execute(
+                "SELECT * FROM confirmed_loads WHERE id = ?", (sched["load_id"],)
+            ).fetchone()
+            e = params_range_error(load, peak, hold)
+            if e:
+                db.rollback()
+                return err(400, e)
+            overlaps = find_overlaps(
+                db, sched["kiln_id"], start, end, exclude_id=schedule_id
+            )
+            if overlaps:
+                db.rollback()
+                return overlap_error(overlaps)
+            db.execute(
+                """UPDATE firing_schedules
+                      SET start_at = ?, end_at = ?, peak_temp = ?, hold_minutes = ?,
+                          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE id = ?""",
+                (fmt_utc(start), fmt_utc(end), peak, hold, schedule_id),
+            )
+            db.commit()
+        except sqlite3.IntegrityError:
+            db.rollback()
+            return err(409, "保存失败：时间须先后有序，原安排保持不变", conflict=True)
+        return schedule_detail(db, schedule_id)
 
     return app
