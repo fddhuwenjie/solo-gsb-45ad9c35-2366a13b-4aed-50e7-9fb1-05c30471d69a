@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>陶瓷合窑装载确认台</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header>
+    <h1>陶瓷合窑装载确认台</h1>
+    <div class="sub">登记待烧批次 · 装窑草案预览 · 版本校验后确认 · 已确认清单不可变</div>
+  </header>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <main class="grid">
+    <!-- 左列：批次 -->
+    <section class="card">
+      <h2>① 待烧批次</h2>
+      <form id="batch-form" class="row-form">
+        <input id="b-code" placeholder="批次编号，如 B-2026-001" required />
+        <label>峰温 °C
+          <input id="b-peak-min" type="number" step="1" placeholder="下限" required style="width:80px" />
+          <span>~</span>
+          <input id="b-peak-max" type="number" step="1" placeholder="上限" required style="width:80px" />
+        </label>
+        <label>保温 分钟
+          <input id="b-hold-min" type="number" step="1" placeholder="下限" required style="width:70px" />
+          <span>~</span>
+          <input id="b-hold-max" type="number" step="1" placeholder="上限" required style="width:70px" />
+        </label>
+        <button type="submit">登记批次</button>
+      </form>
+      <table id="batch-table">
+        <thead>
+          <tr><th>编号</th><th>峰温闭区间(°C)</th><th>保温闭区间(min)</th><th>版本</th><th>状态</th><th></th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <!-- 中列：草案与预览 -->
+    <section class="card">
+      <h2>② 装窑草案与预览</h2>
+      <div class="row-form">
+        <input id="d-name" placeholder="草案名称" />
+        <select id="d-kiln"></select>
+        <button id="draft-create">新建草案</button>
+      </div>
+      <div class="row-form">
+        <label>选择草案
+          <select id="draft-select"></select>
+        </label>
+        <button id="draft-delete" class="secondary">删除草案</button>
+      </div>
+
+      <div id="draft-panel" class="hidden">
+        <div class="row-form">
+          <label>批次
+            <select id="item-batch"></select>
+          </label>
+          <label>窑位
+            <select id="item-pos"></select>
+          </label>
+          <button id="item-add">放入草案</button>
+          <button id="btn-preview" class="accent">预览共同工艺区间</button>
+        </div>
+
+        <h3>窑位占位</h3>
+        <div id="position-map" class="pos-map"></div>
+
+        <h3>草案中的批次</h3>
+        <table id="item-table">
+          <thead>
+            <tr><th>窑位</th><th>批次</th><th>峰温</th><th>保温(min)</th><th>版本</th><th></th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+
+        <div id="preview-box" class="preview hidden"></div>
+
+        <button id="btn-confirm" class="confirm" disabled>按当前预览确认装窑</button>
+        <p class="hint">确认会携带预览时的草案版本与批次版本；若期间有人调整位置或修改工艺范围，将被拒绝并提示刷新。</p>
+      </div>
+    </section>
+
+    <!-- 右列：已确认窑次 -->
+    <section class="card">
+      <h2>③ 已确认窑次（快照）</h2>
+      <button id="loads-refresh" class="secondary">刷新</button>
+      <div id="load-list"></div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

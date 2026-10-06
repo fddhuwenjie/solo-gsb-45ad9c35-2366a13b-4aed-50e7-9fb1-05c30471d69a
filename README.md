@@ -1,0 +1,87 @@
+# 陶瓷合窑装载确认台
+
+用于陶瓷车间“合窑”前的装载登记与确认：登记待烧批次允许的**峰温闭区间**与**保温分钟闭区间**，
+把批次放入某台窑的装窑草案，预览共同可用工艺区间与窑位占位，校验通过后一次性确认生成
+**不可变装载清单**。后端 Python Flask + SQLite，前端原生 JavaScript（无构建步骤）。
+
+## 一键启动
+
+```bash
+docker compose up --build -d
+```
+
+启动后访问：
+
+- 地址：**http://localhost:8000**
+- 端口：**8000**（宿主机 `8000` → 容器 `8000`，可在 `docker-compose.yml` 的 `ports` 中修改）
+
+停止：`docker compose down`；数据保存在 Docker 卷 `kiln-data`（容器/服务重启后已确认清单仍保留），
+如需连数据一起清除：`docker compose down -v`。
+
+## 本地直接运行（不用 Docker）
+
+```bash
+pip install -r requirements.txt
+python wsgi.py        # 或：flask --app wsgi run --host 0.0.0.0 --port 8000
+```
+
+此时 SQLite 数据库文件为 `/data/kiln.db`（需对 `/data` 有写权限）；
+也可用环境变量覆盖，默认配置见 `app/db.py`。
+
+## 使用流程
+
+1. **登记批次**：填写批次编号、允许峰温上下限（°C）、保温分钟上下限（闭区间）。
+   修改工艺范围会使批次版本 `version + 1`，此前的预览立即过期。
+2. **新建草案并选窑**：系统预置两台窑 `K1`、`K2`，每台 8 个固定编号窑位（1~8）。
+3. **放入批次**：为批次选择窑位加入草案，**一批占一位**；向已占位的窑位放入新批次会替换原批次。
+4. **预览**：查看
+   - 共同可用峰温区间（各批次峰温范围交集）；
+   - 共同可用保温分钟区间（各批次保温范围交集）；
+   - 每个固定窑位的占位情况；
+   - 区间无交集、批次已被其他已确认窑次占用等冲突（指出冲突批次/窑位）。
+5. **确认装窑**：确认请求必须携带预览时的**草案版本**与各**批次版本及窑位快照**。
+   服务器在单个事务内重查全部条件：
+   - 草案版本、各批次版本、各窑位与预览一致，否则返回 `409 stale`，提示刷新后重新预览，**不得按过期预览确认**；
+   - 窑位不重复；
+   - 峰温、保温两项区间均有交集；
+   - 批次未被其他已确认窑次使用。
+
+   任一失败都会指出冲突批次或窑位，**草案与已确认记录均不改变，也不占用部分批次**。
+6. **不可变快照**：确认成功后一次写入装载清单（头 + 明细，含当时共同峰温/保温区间与各批次范围快照），
+   草案置为 `confirmed`。之后再修改批次工艺范围不影响已确认清单；已确认记录无任何修改/删除入口。
+7. **并发争用**：两个草案同时争用同一批次时，确认在 `BEGIN IMMEDIATE` 事务内重查，
+   并由 `confirmed_load_items.batch_id` 的全局唯一约束兜底——只有一个确认能成功，另一个收到冲突提示。
+8. **重启保留**：数据持久化在 SQLite 文件（Docker 卷 `/data/kiln.db`，WAL 模式），重启后已确认清单按快照正常查询。
+
+## 主要 HTTP API
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/kilns` | 窑与固定窑位 |
+| GET/POST | `/api/batches` | 批次列表 / 登记 |
+| PUT/DELETE | `/api/batches/{id}` | 改工艺范围（带版本，乐观锁）/ 删除未使用批次 |
+| GET/POST | `/api/drafts` | 草案列表 / 新建草案 |
+| GET/DELETE | `/api/drafts/{id}` | 草案详情 / 删除未确认草案 |
+| PUT | `/api/drafts/{id}/items` | 批次放入窑位 `{batch_id, pos_no}` |
+| DELETE | `/api/drafts/{id}/items/{batch_id}` | 移出批次 |
+| GET | `/api/drafts/{id}/preview` | 只读预览共同区间、占位、冲突 |
+| POST | `/api/drafts/{id}/confirm` | 携带 `{draft_version, items:[{batch_id,batch_version,pos_no}]}` 确认 |
+| GET | `/api/loads`、`/api/loads/{id}` | 已确认窑次列表 / 快照详情 |
+
+过期预览确认返回示例：
+
+```json
+{ "error": "批次 B-001 的工艺范围自预览后已被修改，请刷新并重新预览后再确认", "stale": true }
+```
+
+## 目录结构
+
+```
+Dockerfile / docker-compose.yml   一键启动
+wsgi.py                           gunicorn 入口
+schema.sql                        建表脚本（启动时自动执行）
+requirements.txt
+app/__init__.py                   Flask 路由、预览与确认事务
+app/db.py                         SQLite 连接/初始化、固定窑位种子数据
+app/static/                       原生前端（index.html / app.js / styles.css）
+```

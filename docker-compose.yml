@@ -1,0 +1,12 @@
+services:
+  kiln-loading:
+    build: .
+    container_name: kiln-loading-confirm
+    ports:
+      - "8000:8000"
+    volumes:
+      - kiln-data:/data
+    restart: unless-stopped
+
+volumes:
+  kiln-data:
